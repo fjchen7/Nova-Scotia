@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     env::current_dir,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -30,6 +31,16 @@ pub type EE<G> = nova_snark::provider::ipa_pc::EvaluationEngine<G>;
 pub type S<G> = nova_snark::spartan::snark::RelaxedR1CSSNARK<G, EE<G>>;
 pub type C1<G> = CircomCircuit<<G as Group>::Scalar>;
 pub type C2<G> = TrivialTestCircuit<<G as Group>::Scalar>;
+
+pub static BENCHMARK_DATA_FILE: &str = "./nova_benchmark.csv";
+
+pub fn append_to_bench_data_file(content: String) {
+    let mut data_file = OpenOptions::new()
+        .append(true)
+        .open(BENCHMARK_DATA_FILE)
+        .expect("cannot open file");
+    data_file.write(content.as_bytes()).expect("write failed");
+}
 
 #[derive(Clone)]
 pub enum FileLocation {
@@ -164,6 +175,8 @@ where
     G1: Group<Base = <G2 as Group>::Scalar>,
     G2: Group<Base = <G1 as Group>::Scalar>,
 {
+    use std::time::{Duration, Instant};
+
     let root = current_dir().unwrap();
     let witness_generator_output = root.join("circom_witness.wtns");
 
@@ -175,12 +188,15 @@ where
         .collect::<Vec<String>>();
     let mut current_public_input = start_public_input_hex.clone();
 
+    let mut compute_witness_time = Duration::from_secs(0);
+    let start = Instant::now();
     let witness_0 = compute_witness::<G1, G2>(
         current_public_input.clone(),
         private_inputs[0].clone(),
         witness_generator_file.clone(),
         &witness_generator_output,
     );
+    compute_witness_time = compute_witness_time + start.elapsed();
 
     let circuit_0 = CircomCircuit {
         r1cs: r1cs.clone(),
@@ -197,13 +213,16 @@ where
         z0_secondary.clone(),
     );
 
+    let mut step_time = Duration::from_secs(0);
     for i in 0..iteration_count {
+        let start = Instant::now();
         let witness = compute_witness::<G1, G2>(
             current_public_input.clone(),
             private_inputs[i].clone(),
             witness_generator_file.clone(),
             &witness_generator_output,
         );
+        compute_witness_time = compute_witness_time + start.elapsed();
 
         let circuit = CircomCircuit {
             r1cs: r1cs.clone(),
@@ -216,6 +235,7 @@ where
             .map(|&x| format!("{:?}", x).strip_prefix("0x").unwrap().to_string())
             .collect();
 
+        let start = Instant::now();
         let res = recursive_snark.prove_step(
             &pp,
             &circuit,
@@ -223,10 +243,17 @@ where
             start_public_input.clone(),
             z0_secondary.clone(),
         );
+        step_time = step_time + start.elapsed();
         assert!(res.is_ok());
     }
     fs::remove_file(witness_generator_output)?;
-
+    println!("pure step time: {}", step_time.as_secs_f32());
+    println!("compute witness time: {}", compute_witness_time.as_secs_f32());
+    append_to_bench_data_file(format!(
+        "{},{},",
+        step_time.as_secs_f32(),
+        compute_witness_time.as_secs_f32()
+    ));
     Ok(recursive_snark)
 }
 

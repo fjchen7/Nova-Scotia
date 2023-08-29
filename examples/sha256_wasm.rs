@@ -2,13 +2,14 @@
 
 use ark_std::{end_timer, start_timer};
 
-use std::{collections::HashMap, env, env::current_dir, time::Instant};
+use std::{collections::HashMap, env, env::current_dir, io::Write, time::Instant};
 
 use ff::derive::bitvec::vec;
 use ff::PrimeField;
 use nova_scotia::{
+    append_to_bench_data_file,
     circom::{circuit::CircomCircuit, reader::load_r1cs},
-    create_public_params, create_recursive_circuit, FileLocation, F, S,
+    create_public_params, create_recursive_circuit, FileLocation, BENCHMARK_DATA_FILE, F, S,
 };
 // Ignore create_recursive_circuit
 pub type G1 = pasta_curves::pallas::Point;
@@ -95,7 +96,8 @@ fn recursive_hashing(depth: usize) {
     );
 
     // create a recursive SNARK
-    let timer_create_proof = start_timer!(|| "Create RecursiveSNARK");
+    println!("RecursiveSNARK Creation starts");
+    let start = Instant::now();
     let recursive_snark = create_recursive_circuit(
         FileLocation::PathBuf(witness_generator_wasm),
         r1cs,
@@ -104,14 +106,14 @@ fn recursive_hashing(depth: usize) {
         &pp,
     )
     .unwrap();
-    end_timer!(timer_create_proof);
+    println!("RecursiveSNARK creation took {:?}", start.elapsed());
+    let time_create_snark = start.elapsed();
+    let mut creation_time = start.elapsed();
 
     // TODO: empty?
     let z0_secondary = vec![<G2 as Group>::Scalar::zero()];
 
     // verify the recursive SNARK
-    println!("Verifying a RecursiveSNARK...");
-    let timer_verify_snark = start_timer!(|| "verify SNARK");
     let start = Instant::now();
     let res = recursive_snark.verify(
         &pp,
@@ -120,20 +122,21 @@ fn recursive_hashing(depth: usize) {
         z0_secondary.as_slice(),
     );
     assert!(res.is_ok());
+    let time_verify_snark = start.elapsed();
+    println!("Verifying RecursiveSNARK took {:?}", time_verify_snark);
 
-    end_timer!(timer_verify_snark);
-
-    // produce a compressed SNARK
-    let timer_gen_compressed_snark =
-        start_timer!(|| "Generate a CompressedSNARK using Spartan with IPA-PC");
     let start = Instant::now();
     let (pk, vk) = CompressedSNARK::<_, _, _, _, S1, S2>::setup(&pp).unwrap();
     let res = CompressedSNARK::<_, _, _, _, S1, S2>::prove(&pp, &pk, &recursive_snark);
     assert!(res.is_ok());
     let compressed_snark = res.unwrap();
-    end_timer!(timer_gen_compressed_snark);
+    let time_create_compressed_snark = start.elapsed();
+    creation_time = creation_time + time_create_compressed_snark;
+    println!(
+        "Compress RecursiveSNARK took {:?}",
+        time_create_compressed_snark
+    );
 
-    let timer_verify_compressed_snark = start_timer!(|| "Verify CompressedSNARK");
     let start = Instant::now();
     let res = compressed_snark.verify(
         &vk,
@@ -141,15 +144,47 @@ fn recursive_hashing(depth: usize) {
         start_public_input.clone(),
         z0_secondary,
     );
-    end_timer!(timer_verify_compressed_snark);
+    let time_verify_compressed_snark = start.elapsed();
+    println!(
+        "Verifying CompressedSNARK took {:?}",
+        time_verify_compressed_snark
+    );
+
+    append_to_bench_data_file(format!(
+        "{},{},{},{},{},{},{}\n",
+        creation_time.as_secs_f32(),
+        time_create_snark.as_secs_f32(),
+        time_verify_snark.as_millis(),
+        time_create_compressed_snark.as_secs_f32(),
+        time_verify_compressed_snark.as_millis(),
+        pp.num_constraints().0,
+        pp.num_constraints().1
+    ));
 
     assert!(res.is_ok());
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let k: usize = args[1].parse().unwrap();
+    // let args: Vec<String> = env::args().collect();
+    // let k: usize = args[1].parse().unwrap();
 
-    // NOTE: Toggle here
-    recursive_hashing(k);
+    // let mut file = std::fs::File::create("nova_benchmark.csv").unwrap();
+    let mut file = std::fs::File::create(BENCHMARK_DATA_FILE).unwrap();
+    file.write_all(b"count_per_step,steps,total_count,time_pure_step,time_compute_witness,time_create,time_create_snarks,time_verify_snarks (ms),time_create_compressed,time_verify_compressed (ms),#constraints_of_circuit1,#constraints_of_circuit2\n")
+        .unwrap();
+    let total_count = 1000;
+    let counts_per_step = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
+    ];
+    for count in counts_per_step {
+        let iteration = total_count / count;
+        append_to_bench_data_file(format!("{},{},{},", count, iteration, count * iteration));
+        std::process::Command::new("bash")
+            .arg("examples/sha256/circom/compile_vesta.sh")
+            .arg(count.to_string())
+            .output()
+            .expect("failed to execute process");
+        println!("processing count {} x iteration {}", count, iteration);
+        recursive_hashing(iteration);
+    }
 }
